@@ -32,6 +32,7 @@ export function useSpeechToText(onTranscriptUpdate: (text: string) => void) {
   const lastProcessedRef = useRef("");
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recognitionInstanceRef = useRef<WebSpeechRecognition | null>(null);
+  const transcriptBufferRef = useRef<string>("");
 
   // Watch for transcript changes from microphone
   useEffect(() => {
@@ -58,7 +59,6 @@ export function useSpeechToText(onTranscriptUpdate: (text: string) => void) {
   const startSystemAudioRecognition = useCallback(
     async (stream: MediaStream) => {
       try {
-        // Check if MediaRecorder is supported
         if (!window.MediaRecorder) {
           throw new Error("MediaRecorder is not supported in this browser");
         }
@@ -70,57 +70,78 @@ export function useSpeechToText(onTranscriptUpdate: (text: string) => void) {
 
         console.log("Using MIME type:", mimeType);
 
-        // Create MediaRecorder instance with supported MIME type
+        // Create MediaRecorder with better quality settings
         const mediaRecorder = new MediaRecorder(stream, {
           mimeType: mimeType,
           audioBitsPerSecond: 128000,
         });
 
+        let audioChunks: Blob[] = [];
+        let chunkCount = 0;
+        const MAX_CHUNKS = 4; // Process every 4 chunks (12 seconds with 3s chunks)
+
         // Handle audio data
         mediaRecorder.ondataavailable = async (event) => {
           if (event.data.size > 0) {
-            try {
-              // Convert blob to base64
-              const blob = event.data;
-              const reader = new FileReader();
+            audioChunks.push(event.data);
+            chunkCount++;
 
-              reader.onloadend = async () => {
-                try {
-                  const base64Audio = reader.result as string;
-                  console.log("Sending audio chunk for transcription...");
-
-                  const response = await fetch("/api/transcribe", {
-                    method: "POST",
-                    headers: {
-                      "Content-Type": "application/json",
-                    },
-                    body: JSON.stringify({ audio: base64Audio }),
-                  });
-
-                  const data = await response.json();
-
-                  if (!response.ok) {
-                    console.error("Transcription API error:", data);
-                    throw new Error(data.error || "Transcription failed");
-                  }
-
-                  if (data.text && data.text.trim()) {
-                    console.log("Received transcription:", data.text);
-                    onTranscriptUpdate(data.text);
-                  }
-                } catch (err) {
-                  console.error("Error processing audio:", err);
-                }
-              };
-
-              reader.onerror = () => {
-                console.error("Error reading audio data");
-              };
-
-              reader.readAsDataURL(blob);
-            } catch (err) {
-              console.error("Error handling audio data:", err);
+            // Process chunks when we have enough or on stop
+            if (chunkCount >= MAX_CHUNKS) {
+              const combinedBlob = new Blob(audioChunks, { type: mimeType });
+              processAudioChunk(combinedBlob);
+              audioChunks = []; // Clear processed chunks
+              chunkCount = 0;
             }
+          }
+        };
+
+        const processAudioChunk = async (blob: Blob) => {
+          try {
+            const reader = new FileReader();
+            reader.onloadend = async () => {
+              try {
+                const base64Audio = reader.result as string;
+                console.log("Processing audio chunk...");
+
+                const response = await fetch("/api/transcribe", {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/json",
+                  },
+                  body: JSON.stringify({ audio: base64Audio }),
+                });
+
+                const data = await response.json();
+
+                if (!response.ok) {
+                  console.error("Transcription API error:", data);
+                  throw new Error(data.error || "Transcription failed");
+                }
+
+                if (data.text && data.text.trim()) {
+                  // Append new text to buffer and update
+                  const newText = data.text.trim();
+                  transcriptBufferRef.current +=
+                    (transcriptBufferRef.current ? " " : "") + newText;
+                  console.log(
+                    "Updated transcript:",
+                    transcriptBufferRef.current
+                  );
+                  onTranscriptUpdate(transcriptBufferRef.current);
+                }
+              } catch (err) {
+                console.error("Error processing audio:", err);
+              }
+            };
+
+            reader.onerror = () => {
+              console.error("Error reading audio data");
+            };
+
+            reader.readAsDataURL(blob);
+          } catch (err) {
+            console.error("Error handling audio data:", err);
           }
         };
 
@@ -133,13 +154,22 @@ export function useSpeechToText(onTranscriptUpdate: (text: string) => void) {
         // Handle stop event
         mediaRecorder.onstop = () => {
           console.log("MediaRecorder stopped");
+          // Process any remaining chunks
+          if (audioChunks.length > 0) {
+            const finalBlob = new Blob(audioChunks, { type: mimeType });
+            processAudioChunk(finalBlob);
+          }
+          audioChunks = [];
+          chunkCount = 0;
+          transcriptBufferRef.current = ""; // Clear buffer on stop
         };
 
-        // Start recording with shorter chunks for more frequent updates
-        mediaRecorder.start(2000); // Capture in 2-second chunks
+        // Start recording with chunks
+        mediaRecorder.start(3000); // 3-second chunks
         mediaRecorderRef.current = mediaRecorder;
         setIsListening(true);
         lastProcessedRef.current = "";
+        transcriptBufferRef.current = ""; // Clear buffer on start
 
         console.log("MediaRecorder started successfully");
       } catch (err) {
